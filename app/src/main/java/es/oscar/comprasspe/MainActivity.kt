@@ -6,9 +6,6 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Matrix
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
@@ -23,10 +20,12 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -67,6 +66,8 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -79,6 +80,8 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -87,9 +90,10 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
-import androidx.exifinterface.media.ExifInterface
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -129,39 +133,68 @@ fun Tema(content: @Composable () -> Unit) {
     MaterialTheme(colorScheme = esquema, content = content)
 }
 
+class ArticuloEdit(a: String, u: String, c: String) {
+    var articulo by mutableStateOf(a)
+    var unidad by mutableStateOf(u)
+    var cantidad by mutableStateOf(c)
+}
+
 /** Lo que se está revisando o editando. */
 class EditorState(
     val id: String?,
     fecha: LocalDate,
     total: String,
-    nota: String,
-    val foto: Uri?,
-    val creado: Long
+    val nota: String,
+    val fotoNueva: Uri?,
+    val fotoGuardada: String?,
+    val creado: Long,
+    iniciales: List<Articulo>
 ) {
     var fecha by mutableStateOf(fecha)
     var total by mutableStateOf(total)
-    var nota by mutableStateOf(nota)
+    val articulos = mutableStateListOf<ArticuloEdit>().apply {
+        iniciales.forEach { add(ArticuloEdit(it.articulo, it.unidad, it.cantidad)) }
+    }
+    var quitarFoto by mutableStateOf(false)
     var leyendo by mutableStateOf(false)
+    var guardando by mutableStateOf(false)
     var aviso by mutableStateOf<String?>(null)
     var error by mutableStateOf(false)
 
+    fun tieneFoto() = fotoNueva != null || fotoGuardada != null
+
+    fun fotoVisible(ctx: Context): Uri? =
+        if (quitarFoto) null else fotoNueva ?: fotoGuardada?.let { Fotos.uri(ctx, it) }
+
+    fun articulosLimpios(): List<Articulo> = articulos
+        .map { Articulo(it.articulo.trim(), it.unidad.trim(), it.cantidad.trim()) }
+        .filter { it.articulo.isNotEmpty() || it.cantidad.isNotEmpty() }
+
     companion object {
-        fun de(c: Compra) = EditorState(c.id, c.fecha, importeTexto(c.total), c.nota, null, c.creado)
-        fun nueva(foto: Uri? = null) =
-            EditorState(null, LocalDate.now(), "", "", foto, System.currentTimeMillis())
+        fun de(c: Compra) = EditorState(
+            c.id, c.fecha, importeTexto(c.total), c.nota, null, c.foto, c.creado, c.articulos
+        )
+        fun nueva(foto: Uri? = null) = EditorState(
+            null, LocalDate.now(), "", "", foto, null, System.currentTimeMillis(), emptyList()
+        )
     }
 }
 
 @Composable
 fun App() {
     val ctx = LocalContext.current
-    val store = remember { Store(ctx).also { limpiarFotosViejas(ctx) } }
+    val store = remember { Store(ctx).also { limpiarTemporales(ctx) } }
     var compras by remember { mutableStateOf(store.load()) }
     val actual = remember { periodoDe(LocalDate.now()) }
     var periodo by rememberSaveable { mutableStateOf(actual) }
     var editor by remember { mutableStateOf<EditorState?>(null) }
     var fotoUri by rememberSaveable { mutableStateOf<Uri?>(null) }
     val scope = rememberCoroutineScope()
+
+    fun guardarLista(nueva: List<Compra>) {
+        compras = nueva
+        store.saveAll(nueva)
+    }
 
     val tomarFoto = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
         val uri = fotoUri
@@ -176,23 +209,23 @@ fun App() {
                     null
                 }
                 st.leyendo = false
-                when {
-                    r == null -> {
-                        st.error = true
-                        st.aviso = "No se ha podido leer la foto. Escribe el total a mano."
-                    }
-                    r.total == null -> {
-                        r.fecha?.let { st.fecha = it }
-                        st.error = true
-                        st.aviso = "No se ha encontrado el total. Prueba con otra foto más nítida o escríbelo a mano."
-                    }
-                    else -> {
-                        st.total = importeTexto(r.total)
-                        r.fecha?.let { st.fecha = it }
-                        st.aviso = "Ticket leído. Comprueba el total y la fecha antes de guardar." +
-                            if (r.fecha == null) " No se ha encontrado la fecha: se ha puesto la de hoy." else ""
-                    }
+                if (r == null) {
+                    st.error = true
+                    st.aviso = "No se ha podido leer la foto. Rellena los datos a mano; la foto se guardará igualmente."
+                    return@launch
                 }
+                r.fecha?.let { st.fecha = it }
+                r.total?.let { st.total = importeTexto(it) }
+                st.articulos.clear()
+                r.articulos.forEach { st.articulos.add(ArticuloEdit(it.articulo, it.unidad, it.cantidad)) }
+                val faltan = buildList {
+                    if (r.total == null) add("el total")
+                    if (r.fecha == null) add("la fecha (se ha puesto la de hoy)")
+                    if (r.articulos.isEmpty()) add("los artículos")
+                }
+                st.error = r.total == null
+                st.aviso = if (faltan.isEmpty()) "Ticket leído. Comprueba los datos antes de guardar."
+                else "No se ha encontrado " + faltan.joinToString(", ") + ". Compruébalo y complétalo a mano."
             }
         }
     }
@@ -214,15 +247,31 @@ fun App() {
         Editor(
             st = st,
             onCancel = { editor = null },
-            onSave = { c ->
-                compras = compras.filter { it.id != c.id } + c
-                store.saveAll(compras)
-                periodo = periodoDe(c.fecha)
-                editor = null
+            onSave = { total ->
+                scope.launch {
+                    st.guardando = true
+                    val id = st.id ?: nuevoId()
+                    var foto: String? = if (st.quitarFoto) null else st.fotoGuardada
+                    val nueva = st.fotoNueva
+                    if (nueva != null && !st.quitarFoto) {
+                        val nombre = withContext(Dispatchers.IO) { Fotos.guardar(ctx, nueva, id) }
+                        if (nombre != null) foto = nombre
+                        else Toast.makeText(ctx, "No se ha podido guardar la foto.", Toast.LENGTH_LONG).show()
+                    }
+                    val vieja = st.fotoGuardada
+                    if (vieja != null && vieja != foto) Fotos.borrar(ctx, vieja)
+                    val c = Compra(id, st.fecha, total, st.nota, st.creado, st.articulosLimpios(), foto)
+                    guardarLista(compras.filter { it.id != id } + c)
+                    periodo = periodoDe(c.fecha)
+                    editor = null
+                }
             },
-            onDelete = { id ->
-                compras = compras.filter { it.id != id }
-                store.saveAll(compras)
+            onDelete = {
+                val id = st.id
+                if (id != null) {
+                    st.fotoGuardada?.let { Fotos.borrar(ctx, it) }
+                    guardarLista(compras.filter { it.id != id })
+                }
                 editor = null
             }
         )
@@ -239,7 +288,12 @@ fun App() {
             },
             onManual = { editor = EditorState.nueva() },
             onEditar = { editor = EditorState.de(it) },
-            onExportar = { exportarCsv(ctx, periodo, it) }
+            onExportar = { exportarCsv(ctx, periodo, it) },
+            onBorrarFotos = { lista ->
+                val ids = lista.map { it.id }.toSet()
+                lista.forEach { c -> c.foto?.let { Fotos.borrar(ctx, it) } }
+                guardarLista(compras.map { if (it.id in ids) it.copy(foto = null) else it })
+            }
         )
     }
 }
@@ -253,12 +307,14 @@ fun Principal(
     onFoto: () -> Unit,
     onManual: () -> Unit,
     onEditar: (Compra) -> Unit,
-    onExportar: (List<Compra>) -> Unit
+    onExportar: (List<Compra>) -> Unit,
+    onBorrarFotos: (List<Compra>) -> Unit
 ) {
     val lista = compras
         .filter { periodoDe(it.fecha) == periodo }
         .sortedWith(compareByDescending<Compra> { it.fecha }.thenByDescending { it.creado })
     val total = lista.sumOf { it.total }
+    var verFotos by remember { mutableStateOf(false) }
 
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
@@ -279,13 +335,16 @@ fun Principal(
             item { Cabecera(periodo, actual, total, lista.size, onPeriodo) }
             item {
                 Row(
-                    Modifier.padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 6.dp),
+                    Modifier
+                        .horizontalScroll(rememberScrollState())
+                        .padding(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 6.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     OutlinedButton(onClick = onManual) { Text("Añadir a mano") }
                     if (lista.isNotEmpty()) {
                         OutlinedButton(onClick = { onExportar(lista) }) { Text("Exportar CSV") }
                     }
+                    OutlinedButton(onClick = { verFotos = true }) { Text("Fotos") }
                 }
             }
             if (lista.isEmpty()) {
@@ -302,76 +361,137 @@ fun Principal(
             item { Spacer(Modifier.navigationBarsPadding().height(110.dp)) }
         }
     }
+
+    if (verFotos) {
+        GestionFotos(compras, actual, onClose = { verFotos = false }, onBorrar = {
+            onBorrarFotos(it)
+            verFotos = false
+        })
+    }
+}
+
+@Composable
+fun GestionFotos(
+    compras: List<Compra>,
+    actual: YearMonth,
+    onClose: () -> Unit,
+    onBorrar: (List<Compra>) -> Unit
+) {
+    val ctx = LocalContext.current
+    val cs = MaterialTheme.colorScheme
+    val conFoto = compras.filter { it.foto != null }
+    val anteriores = conFoto.filter { periodoDe(it.fecha) < actual }
+    val megas = remember { Fotos.espacio(ctx) / 1048576.0 }
+    var confirmar by remember { mutableStateOf<List<Compra>?>(null) }
+
+    val pendiente = confirmar
+    if (pendiente != null) {
+        AlertDialog(
+            onDismissRequest = { confirmar = null },
+            title = { Text(if (pendiente.size == 1) "¿Borrar 1 foto?" else "¿Borrar ${pendiente.size} fotos?") },
+            text = { Text("Las compras se mantienen; solo se borran las fotos.") },
+            confirmButton = {
+                TextButton(onClick = { confirmar = null; onBorrar(pendiente) }) { Text("Borrar fotos", color = cs.error) }
+            },
+            dismissButton = { TextButton(onClick = { confirmar = null }) { Text("Cancelar") } }
+        )
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Fotos guardadas") },
+        text = {
+            Column {
+                Text(
+                    when (conFoto.size) {
+                        0 -> "No hay fotos guardadas."
+                        1 -> "1 foto, ocupa " + String.format(ES, "%.1f MB.", megas)
+                        else -> "${conFoto.size} fotos, ocupan " + String.format(ES, "%.1f MB.", megas)
+                    }
+                )
+                Spacer(Modifier.height(12.dp))
+                TextButton(onClick = { confirmar = anteriores }, enabled = anteriores.isNotEmpty()) {
+                    Text("Borrar las de nóminas anteriores (${anteriores.size})")
+                }
+                TextButton(onClick = { confirmar = conFoto }, enabled = conFoto.isNotEmpty()) {
+                    Text("Borrar todas las fotos", color = if (conFoto.isNotEmpty()) cs.error else cs.onSurfaceVariant)
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Text("Cerrar") } }
+    )
 }
 
 @Composable
 fun Cabecera(p: YearMonth, actual: YearMonth, total: Double, n: Int, onPeriodo: (YearMonth) -> Unit) {
     Column(Modifier.fillMaxWidth()) {
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .background(ACERO)
-            .statusBarsPadding()
-            .padding(start = 18.dp, end = 8.dp, top = 10.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(nombrePeriodo(p), color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
-                Text(rango(p), color = Color.White.copy(alpha = 0.8f), fontSize = 14.sp)
-            }
-            TextButton(onClick = { onPeriodo(p.minusMonths(1)) }) {
-                Text("‹", color = Color.White, fontSize = 28.sp)
-            }
-            TextButton(onClick = { onPeriodo(p.plusMonths(1)) }, enabled = p != actual) {
-                Text("›", color = Color.White.copy(alpha = if (p != actual) 1f else 0.3f), fontSize = 28.sp)
-            }
-        }
-        Text(
-            euros(total),
-            color = Color.White,
-            fontSize = 52.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(top = 8.dp)
-        )
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(top = 2.dp, bottom = 16.dp)
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .background(ACERO)
+                .statusBarsPadding()
+                .padding(start = 18.dp, end = 8.dp, top = 10.dp)
         ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(nombrePeriodo(p), color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+                    Text(rango(p), color = Color.White.copy(alpha = 0.8f), fontSize = 14.sp)
+                }
+                TextButton(onClick = { onPeriodo(p.minusMonths(1)) }) {
+                    Text("‹", color = Color.White, fontSize = 28.sp)
+                }
+                TextButton(onClick = { onPeriodo(p.plusMonths(1)) }, enabled = p != actual) {
+                    Text("›", color = Color.White.copy(alpha = if (p != actual) 1f else 0.3f), fontSize = 28.sp)
+                }
+            }
             Text(
-                when (n) { 0 -> "Sin compras"; 1 -> "1 compra"; else -> "$n compras" },
-                color = Color.White.copy(alpha = 0.9f)
+                euros(total),
+                color = Color.White,
+                fontSize = 52.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(top = 8.dp)
             )
-            if (p == actual) {
-                Spacer(Modifier.width(12.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(top = 2.dp, bottom = 16.dp)
+            ) {
                 Text(
-                    "Periodo abierto",
-                    color = TINTA,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier
-                        .background(AMARILLO, RoundedCornerShape(6.dp))
-                        .padding(horizontal = 8.dp, vertical = 1.dp)
+                    when (n) { 0 -> "Sin compras"; 1 -> "1 compra"; else -> "$n compras" },
+                    color = Color.White.copy(alpha = 0.9f)
                 )
+                if (p == actual) {
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        "Periodo abierto",
+                        color = TINTA,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier
+                            .background(AMARILLO, RoundedCornerShape(6.dp))
+                            .padding(horizontal = 8.dp, vertical = 1.dp)
+                    )
+                }
             }
         }
-    }
-    // Franja discontinua amarilla, como una cinta de seguridad
-    Canvas(Modifier.fillMaxWidth().height(6.dp)) {
-        drawRect(ACERO)
-        val w = 14.dp.toPx()
-        val g = 8.dp.toPx()
-        var x = 0f
-        while (x < size.width) {
-            drawRect(AMARILLO, topLeft = Offset(x, 0f), size = Size(w, size.height))
-            x += w + g
+        // Franja discontinua amarilla, como una cinta de seguridad
+        Canvas(Modifier.fillMaxWidth().height(6.dp)) {
+            drawRect(ACERO)
+            val w = 14.dp.toPx()
+            val g = 8.dp.toPx()
+            var x = 0f
+            while (x < size.width) {
+                drawRect(AMARILLO, topLeft = Offset(x, 0f), size = Size(w, size.height))
+                x += w + g
+            }
         }
-    }
     }
 }
 
 @Composable
 fun Fila(c: Compra, onClick: () -> Unit) {
     val cs = MaterialTheme.colorScheme
+    val texto = resumen(c)
     Surface(
         shape = RoundedCornerShape(12.dp),
         color = cs.surface,
@@ -390,13 +510,33 @@ fun Fila(c: Compra, onClick: () -> Unit) {
                 Text(MES3[c.fecha.monthValue - 1], fontSize = 12.sp, color = cs.onSurfaceVariant)
             }
             Spacer(Modifier.width(12.dp))
-            Text(
-                c.nota.ifBlank { "Compra SPE" },
-                color = if (c.nota.isBlank()) cs.onSurfaceVariant else cs.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
+            Column(Modifier.weight(1f)) {
+                Text(
+                    texto.ifBlank { "Compra SPE" },
+                    color = if (texto.isBlank()) cs.onSurfaceVariant else cs.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (c.articulos.isNotEmpty() || c.foto != null) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (c.articulos.isNotEmpty()) {
+                            Text(
+                                if (c.articulos.size == 1) "1 artículo" else "${c.articulos.size} artículos",
+                                fontSize = 13.sp, color = cs.onSurfaceVariant
+                            )
+                        }
+                        if (c.foto != null) {
+                            if (c.articulos.isNotEmpty()) Spacer(Modifier.width(8.dp))
+                            Icon(
+                                painterResource(R.drawable.ic_camara),
+                                contentDescription = "Con foto",
+                                tint = cs.onSurfaceVariant,
+                                modifier = Modifier.size(15.dp)
+                            )
+                        }
+                    }
+                }
+            }
             Spacer(Modifier.width(8.dp))
             Text(euros(c.total), fontSize = 20.sp, fontWeight = FontWeight.Bold)
         }
@@ -407,19 +547,20 @@ fun Fila(c: Compra, onClick: () -> Unit) {
 fun Editor(
     st: EditorState,
     onCancel: () -> Unit,
-    onSave: (Compra) -> Unit,
-    onDelete: (String) -> Unit
+    onSave: (Double) -> Unit,
+    onDelete: () -> Unit
 ) {
     val ctx = LocalContext.current
     val cs = MaterialTheme.colorScheme
     BackHandler { onCancel() }
 
-    var foto by remember(st.foto) { mutableStateOf<ImageBitmap?>(null) }
-    LaunchedEffect(st.foto) {
-        val u = st.foto
-        if (u != null) foto = withContext(Dispatchers.IO) { cargarMiniatura(ctx, u) }
+    val fotoUri = st.fotoVisible(ctx)
+    var miniatura by remember(fotoUri) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(fotoUri) {
+        miniatura = if (fotoUri != null) withContext(Dispatchers.IO) { decodificar(ctx, fotoUri, 1200)?.asImageBitmap() } else null
     }
     var confirmar by remember { mutableStateOf(false) }
+    var ampliar by remember { mutableStateOf(false) }
 
     Column(
         Modifier
@@ -441,16 +582,27 @@ fun Editor(
             TextButton(onClick = onCancel) { Text("Cancelar") }
         }
 
-        foto?.let {
+        miniatura?.let {
             Image(
                 bitmap = it,
-                contentDescription = "Foto del ticket",
+                contentDescription = "Foto del ticket. Toca para ampliar",
                 contentScale = ContentScale.Fit,
                 modifier = Modifier
                     .padding(top = 8.dp)
                     .fillMaxWidth()
                     .heightIn(max = 280.dp)
+                    .clickable { ampliar = true }
             )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Toca la foto para ampliarla", fontSize = 13.sp, color = cs.onSurfaceVariant, modifier = Modifier.weight(1f))
+                TextButton(onClick = { st.quitarFoto = true }) { Text("Quitar foto", color = cs.error) }
+            }
+        }
+        if (st.quitarFoto && st.tieneFoto()) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("La foto se borrará al guardar.", color = cs.onSurfaceVariant, modifier = Modifier.weight(1f))
+                TextButton(onClick = { st.quitarFoto = false }) { Text("Deshacer") }
+            }
         }
 
         if (st.leyendo) {
@@ -495,13 +647,63 @@ fun Editor(
             textStyle = LocalTextStyle.current.copy(fontSize = 30.sp, fontWeight = FontWeight.Bold),
             modifier = Modifier.fillMaxWidth().padding(top = 16.dp)
         )
-        OutlinedTextField(
-            value = st.nota,
-            onValueChange = { st.nota = it },
-            label = { Text("Qué has comprado (opcional)") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth().padding(top = 12.dp)
+
+        Text(
+            "Artículos",
+            fontSize = 16.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = cs.onBackground,
+            modifier = Modifier.padding(top = 20.dp, bottom = 4.dp)
         )
+        if (st.articulos.isEmpty() && !st.leyendo) {
+            Text("Sin artículos.", color = cs.onSurfaceVariant, fontSize = 14.sp)
+        }
+        st.articulos.forEachIndexed { i, a ->
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = cs.surface,
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+            ) {
+                Column(Modifier.padding(10.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = a.articulo,
+                            onValueChange = { a.articulo = it },
+                            label = { Text("Artículo") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        TextButton(onClick = { st.articulos.removeAt(i) }) {
+                            Text("×", fontSize = 24.sp, color = cs.error)
+                        }
+                    }
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.padding(top = 6.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = a.unidad,
+                            onValueChange = { a.unidad = it },
+                            label = { Text("Unidad") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        OutlinedTextField(
+                            value = a.cantidad,
+                            onValueChange = { a.cantidad = it },
+                            label = { Text("Cantidad") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+        }
+        OutlinedButton(
+            onClick = { st.articulos.add(ArticuloEdit("", "", "")) },
+            modifier = Modifier.padding(top = 10.dp)
+        ) { Text("Añadir artículo") }
 
         Row(Modifier.fillMaxWidth().padding(top = 24.dp), verticalAlignment = Alignment.CenterVertically) {
             if (st.id != null) {
@@ -514,25 +716,25 @@ fun Editor(
                     if (t == null) {
                         st.error = true
                         st.aviso = "Pon el total pagado."
-                    } else {
-                        onSave(Compra(st.id ?: nuevoId(), st.fecha, t, st.nota.trim(), st.creado))
-                    }
+                    } else onSave(t)
                 },
-                enabled = !st.leyendo,
+                enabled = !st.leyendo && !st.guardando,
                 colors = ButtonDefaults.buttonColors(containerColor = AMARILLO, contentColor = TINTA)
-            ) { Text("Guardar compra", fontWeight = FontWeight.SemiBold) }
+            ) { Text(if (st.guardando) "Guardando…" else "Guardar compra", fontWeight = FontWeight.SemiBold) }
         }
     }
+
+    if (ampliar && fotoUri != null) VisorFoto(fotoUri) { ampliar = false }
 
     if (confirmar) {
         AlertDialog(
             onDismissRequest = { confirmar = false },
             title = { Text("¿Borrar esta compra?") },
-            text = { Text("Se borrará la compra del ${fechaLarga(st.fecha)}.") },
+            text = { Text("Se borrará la compra del ${fechaLarga(st.fecha)} y su foto.") },
             confirmButton = {
                 TextButton(onClick = {
                     confirmar = false
-                    st.id?.let(onDelete)
+                    onDelete()
                 }) { Text("Borrar", color = cs.error) }
             },
             dismissButton = { TextButton(onClick = { confirmar = false }) { Text("Cancelar") } }
@@ -540,27 +742,53 @@ fun Editor(
     }
 }
 
-fun cargarMiniatura(ctx: Context, uri: Uri): ImageBitmap? {
-    return try {
-        val cr = ctx.contentResolver
-        val medidas = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        cr.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, medidas) }
-        var escala = 1
-        while (maxOf(medidas.outWidth, medidas.outHeight) / (escala * 2) >= 1200) escala *= 2
-        val bmp = cr.openInputStream(uri)?.use {
-            BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = escala })
-        } ?: return null
-        val giro = cr.openInputStream(uri)?.use { ExifInterface(it).rotationDegrees } ?: 0
-        val girada = if (giro != 0) {
-            Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(giro.toFloat()) }, true)
-        } else bmp
-        girada.asImageBitmap()
-    } catch (e: Exception) {
-        null
+/** Foto a pantalla completa; se amplía pellizcando. */
+@Composable
+fun VisorFoto(uri: Uri, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    var img by remember(uri) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(uri) { img = withContext(Dispatchers.IO) { decodificar(ctx, uri, 2400)?.asImageBitmap() } }
+    var escala by remember { mutableFloatStateOf(1f) }
+    var desplaza by remember { mutableStateOf(Offset.Zero) }
+
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Box(
+            Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, pan, zoom, _ ->
+                        escala = (escala * zoom).coerceIn(1f, 6f)
+                        desplaza = if (escala == 1f) Offset.Zero else desplaza + pan
+                    }
+                }
+        ) {
+            img?.let {
+                Image(
+                    bitmap = it,
+                    contentDescription = "Foto del ticket",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            scaleX = escala
+                            scaleY = escala
+                            translationX = desplaza.x
+                            translationY = desplaza.y
+                        }
+                )
+            }
+            TextButton(
+                onClick = onClose,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = 32.dp, end = 8.dp)
+            ) { Text("Cerrar", color = Color.White, fontSize = 17.sp) }
+        }
     }
 }
 
-fun limpiarFotosViejas(ctx: Context) {
+fun limpiarTemporales(ctx: Context) {
     val limite = System.currentTimeMillis() - 24L * 3600 * 1000
     ctx.cacheDir.listFiles()
         ?.filter { it.name.startsWith("ticket_") && it.lastModified() < limite }
@@ -568,13 +796,21 @@ fun limpiarFotosViejas(ctx: Context) {
 }
 
 fun exportarCsv(ctx: Context, p: YearMonth, lista: List<Compra>) {
-    val sb = StringBuilder("\uFEFFFecha;Concepto;Total\n")
-    lista.sortedBy { it.fecha }.forEach {
-        val f = "%02d/%02d/%d".format(it.fecha.dayOfMonth, it.fecha.monthValue, it.fecha.year)
-        sb.append(f).append(";\"").append(it.nota.replace("\"", "\"\"")).append("\";")
-            .append(importeTexto(it.total)).append('\n')
+    fun campo(s: String) = "\"" + s.replace("\"", "\"\"") + "\""
+    val sb = StringBuilder("\uFEFFFecha;Artículo;Unidad;Cantidad;Total ticket\n")
+    lista.sortedBy { it.fecha }.forEach { c ->
+        val f = "%02d/%02d/%d".format(c.fecha.dayOfMonth, c.fecha.monthValue, c.fecha.year)
+        val arts = c.articulos.ifEmpty { listOf(Articulo(c.nota, "", "")) }
+        // El total va solo en la primera línea de cada ticket, así la columna suma bien
+        arts.forEachIndexed { i, a ->
+            sb.append(f).append(';')
+                .append(campo(a.articulo)).append(';')
+                .append(campo(a.unidad)).append(';')
+                .append(campo(a.cantidad)).append(';')
+                .append(if (i == 0) importeTexto(c.total) else "").append('\n')
+        }
     }
-    sb.append(";Total ").append(nombrePeriodo(p).lowercase(ES)).append(';')
+    sb.append(";;;Total ").append(nombrePeriodo(p).lowercase(ES)).append(';')
         .append(importeTexto(lista.sumOf { it.total })).append('\n')
     val archivo = File(ctx.cacheDir, "compras-spe-%d-%02d.csv".format(p.year, p.monthValue))
     archivo.writeText(sb.toString())
