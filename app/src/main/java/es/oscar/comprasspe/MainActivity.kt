@@ -15,6 +15,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -196,36 +197,49 @@ fun App() {
         store.saveAll(nueva)
     }
 
+    /** Abre la revisión con la foto y lee el ticket. */
+    fun leerTicket(uri: Uri) {
+        val st = EditorState.nueva(uri)
+        st.leyendo = true
+        editor = st
+        scope.launch {
+            val r = try {
+                LectorTicket.leer(ctx, uri)
+            } catch (e: Exception) {
+                null
+            }
+            st.leyendo = false
+            if (r == null) {
+                st.error = true
+                st.aviso = "No se ha podido leer la foto. Rellena los datos a mano; la foto se guardará igualmente."
+                return@launch
+            }
+            r.fecha?.let { st.fecha = it }
+            r.total?.let { st.total = importeTexto(it) }
+            st.articulos.clear()
+            r.articulos.forEach { st.articulos.add(ArticuloEdit(it.articulo, it.unidad, it.cantidad)) }
+            val faltan = buildList {
+                if (r.total == null) add("el total")
+                if (r.fecha == null) add("la fecha (se ha puesto la de hoy)")
+                if (r.articulos.isEmpty()) add("los artículos")
+            }
+            st.error = r.total == null
+            st.aviso = if (faltan.isEmpty()) "Ticket leído. Comprueba los datos antes de guardar."
+            else "No se ha encontrado " + faltan.joinToString(", ") + ". Compruébalo y complétalo a mano."
+        }
+    }
+
     val tomarFoto = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
         val uri = fotoUri
-        if (ok && uri != null) {
-            val st = EditorState.nueva(uri)
-            st.leyendo = true
-            editor = st
+        if (ok && uri != null) leerTicket(uri)
+    }
+
+    val elegirFoto = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { origen ->
+        if (origen != null) {
             scope.launch {
-                val r = try {
-                    LectorTicket.leer(ctx, uri)
-                } catch (e: Exception) {
-                    null
-                }
-                st.leyendo = false
-                if (r == null) {
-                    st.error = true
-                    st.aviso = "No se ha podido leer la foto. Rellena los datos a mano; la foto se guardará igualmente."
-                    return@launch
-                }
-                r.fecha?.let { st.fecha = it }
-                r.total?.let { st.total = importeTexto(it) }
-                st.articulos.clear()
-                r.articulos.forEach { st.articulos.add(ArticuloEdit(it.articulo, it.unidad, it.cantidad)) }
-                val faltan = buildList {
-                    if (r.total == null) add("el total")
-                    if (r.fecha == null) add("la fecha (se ha puesto la de hoy)")
-                    if (r.articulos.isEmpty()) add("los artículos")
-                }
-                st.error = r.total == null
-                st.aviso = if (faltan.isEmpty()) "Ticket leído. Comprueba los datos antes de guardar."
-                else "No se ha encontrado " + faltan.joinToString(", ") + ". Compruébalo y complétalo a mano."
+                val copia = withContext(Dispatchers.IO) { copiarATemporal(ctx, origen) }
+                if (copia != null) leerTicket(copia)
+                else Toast.makeText(ctx, "No se ha podido abrir la foto.", Toast.LENGTH_LONG).show()
             }
         }
     }
@@ -286,6 +300,9 @@ fun App() {
                     PackageManager.PERMISSION_GRANTED
                 ) abrirCamara() else pedirCamara.launch(Manifest.permission.CAMERA)
             },
+            onGaleria = {
+                elegirFoto.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            },
             onManual = { editor = EditorState.nueva() },
             onEditar = { editor = EditorState.de(it) },
             onExportar = { exportarCsv(ctx, periodo, it) },
@@ -305,6 +322,7 @@ fun Principal(
     actual: YearMonth,
     onPeriodo: (YearMonth) -> Unit,
     onFoto: () -> Unit,
+    onGaleria: () -> Unit,
     onManual: () -> Unit,
     onEditar: (Compra) -> Unit,
     onExportar: (List<Compra>) -> Unit,
@@ -320,14 +338,25 @@ fun Principal(
         containerColor = MaterialTheme.colorScheme.background,
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         floatingActionButton = {
-            ExtendedFloatingActionButton(
-                text = { Text("Fotografiar ticket", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
-                icon = { Icon(painterResource(R.drawable.ic_camara), contentDescription = null) },
-                onClick = onFoto,
-                containerColor = AMARILLO,
-                contentColor = TINTA,
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier.navigationBarsPadding()
-            )
+            ) {
+                ExtendedFloatingActionButton(
+                    text = { Text("Hacer foto", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
+                    icon = { Icon(painterResource(R.drawable.ic_camara), contentDescription = null) },
+                    onClick = onFoto,
+                    containerColor = AMARILLO,
+                    contentColor = TINTA
+                )
+                ExtendedFloatingActionButton(
+                    text = { Text("Galería", fontWeight = FontWeight.SemiBold, fontSize = 17.sp) },
+                    icon = { Icon(painterResource(R.drawable.ic_galeria), contentDescription = null) },
+                    onClick = onGaleria,
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    contentColor = MaterialTheme.colorScheme.onSurface
+                )
+            }
         },
         floatingActionButtonPosition = FabPosition.Center
     ) { pad ->
@@ -350,7 +379,7 @@ fun Principal(
             if (lista.isEmpty()) {
                 item {
                     Text(
-                        if (periodo == actual) "Aún no hay compras en este periodo. Fotografía un ticket para empezar."
+                        if (periodo == actual) "Aún no hay compras en este periodo. Haz una foto al ticket o elige una de la galería."
                         else "No hubo compras en este periodo.",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(horizontal = 20.dp, vertical = 24.dp)
@@ -785,6 +814,18 @@ fun VisorFoto(uri: Uri, onClose: () -> Unit) {
                     .padding(top = 32.dp, end = 8.dp)
             ) { Text("Cerrar", color = Color.White, fontSize = 17.sp) }
         }
+    }
+}
+
+/** Copia la foto elegida de la galería a la app para poder leerla y guardarla. */
+fun copiarATemporal(ctx: Context, origen: Uri): Uri? {
+    return try {
+        val f = File(ctx.cacheDir, "ticket_${System.currentTimeMillis()}.jpg")
+        val entrada = ctx.contentResolver.openInputStream(origen) ?: return null
+        entrada.use { input -> f.outputStream().use { input.copyTo(it) } }
+        FileProvider.getUriForFile(ctx, ctx.packageName + ".files", f)
+    } catch (e: Exception) {
+        null
     }
 }
 
